@@ -1,36 +1,116 @@
-This is a [Next.js](https://nextjs.org) project bootstrapped with [`create-next-app`](https://nextjs.org/docs/app/api-reference/cli/create-next-app).
+# Clerk: React "unique key prop" warning from ClerkProvider's own children
 
-## Getting Started
+Minimal reproduction for a React key warning that comes from inside
+`ClerkProvider` when it is rendered from a Server Component and given a large
+prop (here the documented `localization` prop).
 
-First, run the development server:
+On every page load, React logs:
 
-```bash
-npm run dev
-# or
-yarn dev
-# or
-pnpm dev
-# or
-bun dev
+```
+Each child in a list should have a unique "key" prop.
+
+Check the render method of `__experimental_CheckoutProvider`. It was passed a child from ClerkProvider.
 ```
 
-Open [http://localhost:3000](http://localhost:3000) with your browser to see the result.
+Nothing in this app renders a list — the array is created inside Clerk.
 
-You can start editing the page by modifying `app/page.tsx`. The page auto-updates as you edit the file.
+## Run it
 
-This project uses [`next/font`](https://nextjs.org/docs/app/building-your-application/optimizing/fonts) to automatically optimize and load [Geist](https://vercel.com/font), a new font family for Vercel.
+```bash
+npm install
+cp .env.example .env.local   # then put your own pk_test_... in it
+npm run dev
+```
 
-## Learn More
+Open http://localhost:3000 and look at the browser console.
 
-To learn more about Next.js, take a look at the following resources:
+There is no `clerkMiddleware` and no `CLERK_SECRET_KEY` in this reproduction:
+the warning is about element creation inside the provider and is independent of
+auth state, so a publishable key alone is enough to see it.
 
-- [Next.js Documentation](https://nextjs.org/docs) - learn about Next.js features and API.
-- [Learn Next.js](https://nextjs.org/learn) - an interactive Next.js tutorial.
+## What triggers it
 
-You can check out [the Next.js GitHub repository](https://github.com/vercel/next.js) - your feedback and contributions are welcome!
+The trigger is a **large prop crossing the RSC boundary**, not the
+`localization` prop specifically. In `app/layout.tsx` (a Server Component):
 
-## Deploy on Vercel
+| `<ClerkProvider …>` props                                | Warning? |
+| -------------------------------------------------------- | -------- |
+| `dynamic localization={ptBR}`  ← current state of this repo | **yes**  |
+| `localization={ptBR}` (no `dynamic`)                      | **yes**  |
+| `dynamic` alone                                            | no       |
+| `localization={{ signIn: { start: { title: "Hi" } } }}`     | no       |
 
-The easiest way to deploy your Next.js app is to use the [Vercel Platform](https://vercel.com/new?utm_medium=default-template&filter=next.js&utm_source=create-next-app&utm_campaign=create-next-app-readme) from the creators of Next.js.
+Swapping the large `ptBR` object for a small one silences it, which is what
+points at the payload rather than the prop.
 
-Check out our [Next.js deployment documentation](https://nextjs.org/docs/app/building-your-application/deploying) for more details.
+On the older `@clerk/nextjs@7.4.0` the warning additionally required `dynamic`
+(a large prop alone was not enough). On `7.7.4` the large prop alone does it.
+The React Compiler is *not* required — this repo does not enable it.
+
+## Why it happens
+
+`NextClientClerkProvider` (`@clerk/nextjs/dist/esm/app-router/client/ClerkProvider.js`)
+renders three **unkeyed** children into `ReactClerkProvider`:
+
+```js
+React.createElement(ReactClerkProvider, { ...mergedProps },
+  React.createElement(RouterTelemetry, null),
+  __internal_scriptsSlot != null ? __internal_scriptsSlot : React.createElement(ClerkScripts, null),
+  children
+)
+```
+
+That three-element array is then forwarded as a single `props.children` through
+`ClerkProviderBase` → `ClerkContextProvider` → `__experimental_CheckoutProvider`
+(`@clerk/shared/react`), where React reconciles it as an array child and checks
+each element for a key.
+
+Elements normally carry React's "created in a static position" mark, so no
+warning is emitted. When the provider's props are large enough that the flight
+payload places `children` in a separate chunk, the deserialized element arrives
+without that mark, and React reports the unkeyed array — attributing the child
+to its owner, `ClerkProvider`.
+
+Inspecting the fiber tree confirms the shape (`CheckoutProvider` holding a
+3-element children array, the RSC-deserialized entries having no `_owner`).
+
+## Suggested fix
+
+Give the children keys where they are created, e.g. in the server provider
+(`app-router/server/ClerkProvider.js`):
+
+```js
+const scriptsSlot = dynamic ? (
+  <Suspense key="clerk-scripts">
+    <DynamicClerkScripts … />
+  </Suspense>
+) : undefined;
+```
+
+and/or key the three children in `NextClientClerkProvider`.
+
+The warning is development-only (React strips key validation in production
+builds) and appears harmless, but it fires on every page load and reads like an
+application bug, which sends people looking through their own components for a
+list that does not exist.
+
+## Environment
+
+```
+System:
+  OS: macOS 26.5
+  CPU: (12) arm64 Apple M4 Pro
+Binaries:
+  Node: 20.19.6
+  npm: 10.8.2
+Browsers:
+  Chrome: 151.0.7922.109
+npmPackages:
+  @clerk/localizations: ^4.15.1 => 4.15.1
+  @clerk/nextjs: ^7.6.4 => 7.7.4
+  next: 16.3.0 => 16.3.0
+  react: 19.2.6 => 19.2.6
+  react-dom: 19.2.6 => 19.2.6
+```
+
+Transitively: `@clerk/react` 6.14.1, `@clerk/shared` 4.28.1.
