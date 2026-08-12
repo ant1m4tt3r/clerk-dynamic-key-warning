@@ -60,19 +60,64 @@ React.createElement(ReactClerkProvider, { ...mergedProps },
 )
 ```
 
-That three-element array is then forwarded as a single `props.children` through
+That three-element array is forwarded as a single `props.children` through
 `ClerkProviderBase` → `ClerkContextProvider` → `__experimental_CheckoutProvider`
-(`@clerk/shared/react`), where React reconciles it as an array child and checks
-each element for a key.
+(`@clerk/shared/react`), where React reconciles it as an array and key-checks
+each entry.
 
-Elements normally carry React's "created in a static position" mark, so no
-warning is emitted. When the provider's props are large enough that the flight
-payload places `children` in a separate chunk, the deserialized element arrives
-without that mark, and React reports the unkeyed array — attributing the child
-to its owner, `ClerkProvider`.
+The array is unkeyed either way; what the payload size changes is whether React
+gets a chance to mark the entries as validated.
 
-Inspecting the fiber tree confirms the shape (`CheckoutProvider` holding a
-3-element children array, the RSC-deserialized entries having no `_owner`).
+**1. Large props make React outline the children into their own rows.** The same
+element, serialized two ways (from the flight payload in the page HTML):
+
+```jsonc
+// small localization prop — one 1.5 KB row, children inlined as elements
+"__internal_scriptsSlot": ["$","$36",null,{…},"$1c","$5a",0],
+"children":               ["$","$L5f",null,{…},null,"$5e",1]
+
+// localization={ptBR} — one 74 KB row, children outlined into separate rows
+"__internal_scriptsSlot": "$L5a",
+"children":               "$L5b"
+```
+
+A `$L<id>` reference deserializes to a **lazy** node, not an element. (The last
+field of an element tuple is React's `validated` flag — note the scripts slot
+ships as `0`.)
+
+**2. `validateChildKeys` can only mark a lazy that has already resolved.** From
+`react.development.js`:
+
+```js
+function validateChildKeys(node) {
+  isValidElement(node)
+    ? node._store && (node._store.validated = 1)          // inlined element → marked
+    : node.$$typeof === REACT_LAZY_TYPE &&
+      ("fulfilled" === node._payload.status
+        ? /* mark the resolved element */
+        : node._store && (node._store.validated = 1));    // pending → marks the WRAPPER
+}
+```
+
+When Clerk calls `createElement`, the outlined rows have not arrived yet, so the
+lazy is still pending and the mark lands on the wrapper — never on the element
+that eventually resolves.
+
+**3. The reconciler resolves the lazy and checks that element.** From
+`react-dom-client.development.js`:
+
+```js
+case REACT_LAZY_TYPE:
+  (child = resolveLazy(child)), warnOnInvalidKey(returnFiber, workInProgress, child, knownKeys);
+```
+
+`warnForMissingKey` then sees `!child._store.validated && null == child.key` on
+the resolved scripts-slot element (`validated: 0` above) and warns, naming the
+reconciling parent (`__experimental_CheckoutProvider`) and the child's `_owner`
+(`ClerkProvider`) — which is precisely the message text.
+
+So payload size does not cause the bug, it only exposes it: the latent issue is
+the unkeyed array, which is immune to any of this once the children carry keys.
 
 ## Suggested fix
 
@@ -87,7 +132,9 @@ const scriptsSlot = dynamic ? (
 ) : undefined;
 ```
 
-and/or key the three children in `NextClientClerkProvider`.
+and/or key the three children in `NextClientClerkProvider`. Keys make the array
+immune regardless of how the flight payload is chunked, which is why this is
+worth fixing at the source rather than treating it as a payload-size quirk.
 
 The warning is development-only (React strips key validation in production
 builds) and appears harmless, but it fires on every page load and reads like an
