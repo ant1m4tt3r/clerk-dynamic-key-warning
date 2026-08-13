@@ -14,6 +14,12 @@ Check the render method of `__experimental_CheckoutProvider`. It was passed a ch
 
 Nothing in this app renders a list — the array is created inside Clerk.
 
+The three children involved are static siblings, which need no keys, so the
+warning appears to be spurious: it comes from a React dev-only check that loses
+track of its own validation mark when RSC streams those children as separate
+chunks. Details in [Why it happens](#why-it-happens) and
+[The warning itself looks like a React bug](#the-warning-itself-looks-like-a-react-bug).
+
 ## Run it
 
 ```bash
@@ -50,7 +56,7 @@ The React Compiler is *not* required — this repo does not enable it.
 ## Why it happens
 
 `NextClientClerkProvider` (`@clerk/nextjs/dist/esm/app-router/client/ClerkProvider.js`)
-renders three **unkeyed** children into `ReactClerkProvider`:
+renders three static sibling children into `ReactClerkProvider`:
 
 ```js
 React.createElement(ReactClerkProvider, { ...mergedProps },
@@ -65,8 +71,10 @@ That three-element array is forwarded as a single `props.children` through
 (`@clerk/shared/react`), where React reconciles it as an array and key-checks
 each entry.
 
-The array is unkeyed either way; what the payload size changes is whether React
-gets a chance to mark the entries as validated.
+Static siblings never need keys — that is why this normally warns about nothing.
+React enforces that rule by *marking* each positional child as validated. What
+the payload size changes is whether that mark lands where the reconciler later
+looks for it.
 
 **1. Large props make React outline the children into their own rows.** The same
 element, serialized two ways (from the flight payload in the page HTML):
@@ -116,13 +124,46 @@ the resolved scripts-slot element (`validated: 0` above) and warns, naming the
 reconciling parent (`__experimental_CheckoutProvider`) and the child's `_owner`
 (`ClerkProvider`) — which is precisely the message text.
 
-So payload size does not cause the bug, it only exposes it: the latent issue is
-the unkeyed array, which is immune to any of this once the children carry keys.
+## The warning itself looks like a React bug
 
-## Suggested fix
+The mark set in step 2 is never read. `react-server-dom-*` creates `$L`
+wrappers with a `_store` for exactly this purpose:
 
-Give the children keys where they are created, e.g. in the server provider
-(`app-router/server/ClerkProvider.js`):
+```js
+function createLazyChunkWrapper(chunk, validated) {
+  var lazyType = { $$typeof: REACT_LAZY_TYPE, _payload: chunk, _init: readChunk };
+  lazyType._debugInfo = chunk._debugInfo;
+  lazyType._store = { validated: validated };   // `$L` refs start at 0
+  return lazyType;
+}
+```
+
+`validateChildKeys` upgrades that wrapper flag to `1` when the lazy appears in a
+valid position, but `warnOnInvalidKey` resolves the lazy and inspects the inner
+element instead — the only reads of `_store.validated` in
+`react-dom-client.development.js` are the three lines inside
+`warnForMissingKey`, which never sees the wrapper. So the upgrade is a dead
+write, and whether you get a warning depends on whether the chunk happened to
+arrive before `createElement` ran.
+
+Three static siblings need no keys, so the code being warned about is correct.
+Honouring the wrapper flag would fix it at the root:
+
+```js
+case REACT_LAZY_TYPE:
+  if (child._store && child._store.validated === 1) break; // passed in a valid location
+  (child = resolveLazy(child)), warnOnInvalidKey(returnFiber, workInProgress, child, knownKeys);
+```
+
+Testing `=== 1` keeps flight's `validated: 2` ("definitely needs a key") warning
+as intended, and genuine arrays are unaffected: `createElement(type, props, [a, b])`
+passes an array, which `validateChildKeys` does not mark at all, so lazies inside
+it keep `validated: 0` and still warn.
+
+## Workaround on the Clerk side
+
+Keys are not required here, but adding them sidesteps the race and ships sooner
+than a React release:
 
 ```js
 const scriptsSlot = dynamic ? (
@@ -132,9 +173,8 @@ const scriptsSlot = dynamic ? (
 ) : undefined;
 ```
 
-and/or key the three children in `NextClientClerkProvider`. Keys make the array
-immune regardless of how the flight payload is chunked, which is why this is
-worth fixing at the source rather than treating it as a payload-size quirk.
+and/or keying the three children in `NextClientClerkProvider`. A keyed child is
+immune however the flight payload is chunked.
 
 The warning is development-only (React strips key validation in production
 builds) and appears harmless, but it fires on every page load and reads like an
